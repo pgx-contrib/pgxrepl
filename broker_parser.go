@@ -11,6 +11,7 @@ import (
 type Parser struct {
 	relations map[uint32]*pglogrepl.RelationMessageV2
 	types     *pgtype.Map
+	handler   Handler
 	stream    bool
 }
 
@@ -21,8 +22,6 @@ func (x *Parser) Parse(data []byte) error {
 		return err
 	}
 
-	// log.Printf("Receive a logical replication message: %s", payload.Type())
-
 	switch message := payload.(type) {
 	case *pglogrepl.RelationMessageV2:
 		x.relations[message.RelationID] = message
@@ -31,33 +30,59 @@ func (x *Parser) Parse(data []byte) error {
 	case *pglogrepl.CommitMessage:
 		// commit transaction
 	case *pglogrepl.InsertMessageV2:
-		// Create a map to store the column values
-		values, err := x.record(message.RelationID, message.Tuple)
+		// Create a map to store the column current
+		current, err := x.record(message.RelationID, message.Tuple)
 		if err != nil {
 			return err
 		}
-		fmt.Println("INSERT", values)
+
+		// arguments
+		args := InsertEventArgs{
+			NewRow: current,
+			Table:  "",
+		}
+		// handle the event
+		if err := x.handler.Handle(args); err != nil {
+			return err
+		}
 	case *pglogrepl.UpdateMessageV2:
 		// create a map to store the column values
 		previous, err := x.record(message.RelationID, message.OldTuple)
 		if err != nil {
 			return err
 		}
-		fmt.Println("UPDATE BEFORE", previous)
 
 		// create a map to store the column values
 		current, err := x.record(message.RelationID, message.NewTuple)
 		if err != nil {
 			return err
 		}
-		fmt.Println("UPDATE AFTER", current)
+
+		// arguments
+		args := UpdateEventArgs{
+			NewRow: current,
+			OldRow: previous,
+			Table:  "",
+		}
+		// handle the event
+		if err := x.handler.Handle(args); err != nil {
+			return err
+		}
 	case *pglogrepl.DeleteMessageV2:
 		// create a map to store the column values
 		previous, err := x.record(message.RelationID, message.OldTuple)
 		if err != nil {
 			return err
 		}
-		fmt.Println("DELETE", previous)
+		// arguments
+		args := DeleteEventArgs{
+			OldRow: previous,
+			Table:  "",
+		}
+		// handle the event
+		if err := x.handler.Handle(args); err != nil {
+			return err
+		}
 	case *pglogrepl.TruncateMessageV2:
 		// not handled
 	case *pglogrepl.TypeMessageV2:
@@ -75,7 +100,7 @@ func (x *Parser) Parse(data []byte) error {
 	case *pglogrepl.StreamAbortMessageV2:
 		// not handled
 	default:
-		// log.Printf("Unknown message type in pgoutput stream: %T", logicalMsg)
+		return fmt.Errorf("unknown message type in pgoutput stream: %T", message)
 	}
 
 	return nil
