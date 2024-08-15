@@ -18,12 +18,12 @@ type Broker struct {
 	Name string
 }
 
-// Serve serves for changes on the replication connection
-func (x *Broker) Serve(ctx context.Context) error {
+// Run starts the replication
+func (x *Broker) Run(ctx context.Context) error {
 	// create the parser
-	parser := &Parser{
+	collector := &Collector{
 		relations: map[uint32]*pglogrepl.RelationMessageV2{},
-		types:     &pgtype.Map{},
+		registry:  &pgtype.Map{},
 		stream:    false,
 	}
 
@@ -81,7 +81,7 @@ func (x *Broker) Serve(ctx context.Context) error {
 			}
 
 			// parse the data
-			if err = parser.Parse(data.WALData); err != nil {
+			if err = collector.Collect(data.WALData); err != nil {
 				return err
 			}
 
@@ -91,9 +91,4 @@ func (x *Broker) Serve(ctx context.Context) error {
 			}
 		}
 	}
-}
-
-// Close closes the replication
-func (x *Broker) Close() error {
-	return nil
 }
