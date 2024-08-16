@@ -45,8 +45,11 @@ func (x *Broker) Run(ctx context.Context) error {
 
 		// receive the message
 		message, err := iterator.Receive(ctx)
-		// handle the error
-		if err != nil {
+		switch {
+		case pgconn.Timeout(err):
+			continue
+		case err != nil:
+			// handle the error
 			return err
 		}
 

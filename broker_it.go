@@ -65,31 +65,15 @@ func (x *Iterator) Receive(ctx context.Context) (pgproto3.BackendMessage, error)
 	message, err := x.conn.ReceiveMessage(ctx)
 	// cancel the context
 	cancel()
-
 	// handle the error
 	if err != nil {
-		if pgconn.Timeout(err) {
-			return nil, nil
-		}
-
 		return nil, err
 	}
 
 	// check if the message is an error response
 	if response, ok := message.(*pgproto3.ErrorResponse); ok {
-		return nil, &Error{response: response}
+		return nil, pgconn.ErrorResponseToPgError(response)
 	}
 
 	return message, nil
-}
-
-// Error is a struct that represents the error
-type Error struct {
-	response *pgproto3.ErrorResponse
-}
-
-// Error returns the error
-func (x *Error) Error() string {
-	return fmt.Sprintf(`code: %v, message: %v, detail: %v, table: %v`,
-		x.response.Code, x.response.Message, x.response.Detail, x.response.TableName)
 }

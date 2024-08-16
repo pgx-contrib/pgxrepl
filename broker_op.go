@@ -32,57 +32,75 @@ func (x *Collector) Collect(data []byte) error {
 	case *pglogrepl.CommitMessage:
 		// commit transaction
 	case *pglogrepl.InsertMessageV2:
-		// Create a map to store the column row
-		row, err := x.row(message.RelationID, message.Tuple)
+		// create a table
+		table, err := x.table(message.RelationID)
 		if err != nil {
 			return err
 		}
 
 		// arguments
-		args := InsertEventArgs{
-			Table:  row.replation.RelationName,
-			NewRow: row,
+		operation := InsertOperation{
+			// set the table
+			Table: table,
+			// set the new row
+			NewRow: &Row{
+				metadata: message.Tuple,
+				relation: table.relation,
+				registry: x.registry,
+			},
 		}
 		// handle the event
-		if err := x.handler.Handle(args); err != nil {
+		if err := x.handler.Handle(operation); err != nil {
 			return err
 		}
 	case *pglogrepl.UpdateMessageV2:
-		// create a map to store the column values
-		oldRow, err := x.row(message.RelationID, message.OldTuple)
-		if err != nil {
-			return err
-		}
-
-		// create a map to store the column values
-		newRow, err := x.row(message.RelationID, message.NewTuple)
+		// create a table
+		table, err := x.table(message.RelationID)
 		if err != nil {
 			return err
 		}
 
 		// arguments
-		args := UpdateEventArgs{
-			Table:  newRow.replation.RelationName,
-			NewRow: newRow,
-			OldRow: oldRow,
+		operation := UpdateOperation{
+			// set the table
+			Table: table,
+			// set the new row
+			NewRow: &Row{
+				metadata: message.NewTuple,
+				relation: table.relation,
+				registry: x.registry,
+			},
+			// set the old row
+			OldRow: &Row{
+				metadata: message.OldTuple,
+				relation: table.relation,
+				registry: x.registry,
+			},
 		}
 		// handle the event
-		if err := x.handler.Handle(args); err != nil {
+		if err := x.handler.Handle(operation); err != nil {
 			return err
 		}
 	case *pglogrepl.DeleteMessageV2:
-		// create a map to store the column values
-		row, err := x.row(message.RelationID, message.OldTuple)
+		// create a table
+		table, err := x.table(message.RelationID)
 		if err != nil {
 			return err
 		}
+
 		// arguments
-		args := DeleteEventArgs{
-			Table:  row.replation.RelationName,
-			OldRow: row,
+		operation := DeleteOperation{
+			// set the table
+			Table: table,
+			// set the old row
+			OldRow: &Row{
+				metadata: message.OldTuple,
+				relation: table.relation,
+				registry: x.registry,
+			},
 		}
 		// handle the event
-		if err := x.handler.Handle(args); err != nil {
+		if err := x.handler.Handle(operation); err != nil {
 			return err
 		}
 	case *pglogrepl.TruncateMessageV2:
@@ -108,77 +126,91 @@ func (x *Collector) Collect(data []byte) error {
 	return nil
 }
 
-func (x *Collector) row(id uint32, data *pglogrepl.TupleData) (*Row, error) {
+func (x *Collector) table(id uint32) (*Table, error) {
 	// get the relation from the relation ID
 	relation, ok := x.relations[id]
 	if !ok {
 		return nil, fmt.Errorf("relation %d not found", id)
 	}
 
-	row := &Row{
-		replation: relation,
-		registry:  x.registry,
-		data:      data,
+	table := &Table{
+		relation: relation,
 	}
 
-	return row, nil
+	return table, nil
 }
 
 // Handler is an interface that represents the handler
 type Handler interface {
+	// Handle handles the operation
 	Handle(any) error
 }
 
-// InsertHandler is a struct that represents the insert handler
-type InsertEventArgs struct {
-	// NewRow is a map that represents the row
-	NewRow pgx.CollectableRow
+// InsertOperation is a struct that represents the insert operation
+type InsertOperation struct {
+	// NewRow is a the actual collecatable row
+	NewRow *Row
 	// Table is a string that represents the table
-	Table string
+	Table *Table
 }
 
-// UpdateHandler is a struct that represents the update handler
-type UpdateEventArgs struct {
-	// NewRow is a map that represents the new row
-	NewRow pgx.CollectableRow
-	// OldRow is a map that represents the old row
-	OldRow pgx.CollectableRow
+// UpdateOperation is a struct that represents the update operation
+type UpdateOperation struct {
+	// NewRow is a the actual collecatable row
+	NewRow *Row
+	// OldRow is a the actual collecatable row
+	OldRow *Row
 	// Table is a string that represents the table
-	Table string
+	Table *Table
 }
 
-// DeleteHandler is a struct that represents the delete handler
-type DeleteEventArgs struct {
-	// OldRow is a map that represents the old row
-	OldRow pgx.CollectableRow
+// DeleteOperation is a struct that represents the delete operation
+type DeleteOperation struct {
+	// OldRow is a the actual collecatable row
+	OldRow *Row
 	// Table is a string that represents the table
-	Table string
+	Table *Table
+}
+
+// Table is a struct that represents the table
+type Table struct {
+	relation *pglogrepl.RelationMessageV2
+}
+
+// Name returns the table name
+func (t *Table) Name() string {
+	return t.relation.RelationName
+}
+
+// Schema returns the table schema
+func (t *Table) Schema() string {
+	return t.relation.Namespace
 }
 
 var _ pgx.CollectableRow = &Row{}
 
 // Row is a struct that represents the row
 type Row struct {
-	data      *pglogrepl.TupleData
-	replation *pglogrepl.RelationMessageV2
-	registry  *pgtype.Map
+	metadata *pglogrepl.TupleData
+	relation *pglogrepl.RelationMessageV2
+	registry *pgtype.Map
 }
 
 // FieldDescriptions implements pgx.CollectableRow.
 func (r *Row) FieldDescriptions() []pgconn.FieldDescription {
 	collection := []pgconn.FieldDescription{}
 
-	for index := range r.data.Columns {
-		column := r.replation.Columns[index]
+	for index := range r.metadata.Columns {
+		column := r.relation.Columns[index]
 
-		item := pgconn.FieldDescription{
-			TableOID:     r.replation.RelationID,
+		description := pgconn.FieldDescription{
 			Name:         column.Name,
 			DataTypeOID:  column.DataType,
 			TypeModifier: column.TypeModifier,
+			TableOID:     r.relation.RelationID,
 		}
 
-		collection = append(collection, item)
+		collection = append(collection, description)
 	}
 
 	return collection
@@ -188,7 +220,7 @@ func (r *Row) FieldDescriptions() []pgconn.FieldDescription {
 func (r *Row) RawValues() [][]byte {
 	collection := make([][]byte, 0)
 
-	for _, column := range r.data.Columns {
+	for _, column := range r.metadata.Columns {
 		collection = append(collection, column.Data)
 	}
 
@@ -213,14 +245,14 @@ func (r *Row) Values() ([]any, error) {
 		return string(data), nil
 	}
 
-	for index, column := range r.data.Columns {
+	for index, column := range r.metadata.Columns {
 		switch column.DataType {
 		case 'n': // null
 			collection = append(collection, nil)
 		case 'u': // unchanged toast
 			// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
 		case 't': // text
-			item, err := decode(r.registry, column.Data, r.replation.Columns[index].DataType)
+			item, err := decode(r.registry, column.Data, r.relation.Columns[index].DataType)
 			if err != nil {
 				return nil, err
 			}
