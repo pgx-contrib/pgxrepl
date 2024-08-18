@@ -12,6 +12,8 @@ import (
 
 // Broker is a struct that represents the replication
 type Broker struct {
+	// Handler is the handler to process the data
+	Handler Handler
 	// Conn is the connection to the database
 	Conn *pgconn.PgConn
 	// Name is the name of the replication
@@ -22,6 +24,7 @@ type Broker struct {
 func (x *Broker) Run(ctx context.Context) error {
 	// create the parser
 	collector := &Collector{
+		handler:   x.Handler,
 		relations: map[uint32]*pglogrepl.RelationMessageV2{},
 		registry:  &pgtype.Map{},
 		stream:    false,

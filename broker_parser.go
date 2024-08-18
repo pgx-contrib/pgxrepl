@@ -2,6 +2,7 @@ package pgxrepl
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -24,28 +25,30 @@ func (x *Collector) Collect(data []byte) error {
 		return err
 	}
 
-	switch message := payload.(type) {
+	switch m := payload.(type) {
 	case *pglogrepl.RelationMessageV2:
-		x.relations[message.RelationID] = message
+		x.relations[m.RelationID] = m
 	case *pglogrepl.BeginMessage:
 		// begin transaction
 	case *pglogrepl.CommitMessage:
 		// commit transaction
 	case *pglogrepl.InsertMessageV2:
-		// create a table
-		table, err := x.table(message.RelationID)
+		// create a relation
+		relation, err := x.relation(m.RelationID)
 		if err != nil {
 			return err
 		}
-
 		// arguments
 		operation := InsertOperation{
-			// set the table
-			Table: table,
+			// set the table name
+			TableName: pgx.Identifier{
+				relation.Namespace,
+				relation.RelationName,
+			},
 			// set the new row
 			NewRow: &Row{
-				metadata: message.Tuple,
-				relation: table.relation,
+				metadata: m.Tuple,
+				relation: relation,
 				registry: x.registry,
 			},
 		}
@@ -54,26 +57,28 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 	case *pglogrepl.UpdateMessageV2:
-		// create a table
-		table, err := x.table(message.RelationID)
+		// create a relation
+		relation, err := x.relation(m.RelationID)
 		if err != nil {
 			return err
 		}
-
 		// arguments
 		operation := UpdateOperation{
-			// set the table
-			Table: table,
+			// set the table name
+			TableName: pgx.Identifier{
+				relation.Namespace,
+				relation.RelationName,
+			},
 			// set the new row
 			NewRow: &Row{
-				metadata: message.NewTuple,
-				relation: table.relation,
+				relation: relation,
+				metadata: m.NewTuple,
 				registry: x.registry,
 			},
 			// set the old row
 			OldRow: &Row{
-				metadata: message.OldTuple,
-				relation: table.relation,
+				relation: relation,
+				metadata: m.OldTuple,
 				registry: x.registry,
 			},
 		}
@@ -82,20 +87,22 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 	case *pglogrepl.DeleteMessageV2:
-		// create a table
-		table, err := x.table(message.RelationID)
+		// create a relation
+		relation, err := x.relation(m.RelationID)
 		if err != nil {
 			return err
 		}
-
 		// arguments
 		operation := DeleteOperation{
-			// set the table
-			Table: table,
+			// set the table name
+			TableName: pgx.Identifier{
+				relation.Namespace,
+				relation.RelationName,
+			},
 			// set the old row
 			OldRow: &Row{
-				metadata: message.OldTuple,
-				relation: table.relation,
+				relation: relation,
+				metadata: m.OldTuple,
 				registry: x.registry,
 			},
 		}
@@ -120,24 +127,20 @@ func (x *Collector) Collect(data []byte) error {
 	case *pglogrepl.StreamAbortMessageV2:
 		// not handled
 	default:
-		return fmt.Errorf("unknown message type in pgoutput stream: %T", message)
+		return fmt.Errorf("unknown message type in pgoutput stream: %T", m)
 	}
 
 	return nil
 }
 
-func (x *Collector) table(id uint32) (*Table, error) {
+func (x *Collector) relation(id uint32) (*pglogrepl.RelationMessageV2, error) {
 	// get the relation from the relation ID
 	relation, ok := x.relations[id]
 	if !ok {
 		return nil, fmt.Errorf("relation %d not found", id)
 	}
 
-	table := &Table{
-		relation: relation,
-	}
-
-	return table, nil
+	return relation, nil
 }
 
 // Handler is an interface that represents the handler
@@ -150,8 +153,8 @@ type Handler interface {
 type InsertOperation struct {
 	// NewRow is a the actual collecatable row
 	NewRow *Row
-	// Table is a string that represents the table
-	Table *Table
+	// TableName is a string that represents the table
+	TableName pgx.Identifier
 }
 
 // UpdateOperation is a struct that represents the update operation
@@ -161,30 +164,15 @@ type UpdateOperation struct {
 	// OldRow is a the actual collecatable row
 	OldRow *Row
 	// Table is a string that represents the table
-	Table *Table
+	TableName pgx.Identifier
 }
 
 // DeleteOperation is a struct that represents the delete operation
 type DeleteOperation struct {
 	// OldRow is a the actual collecatable row
 	OldRow *Row
-	// Table is a string that represents the table
-	Table *Table
-}
-
-// Table is a struct that represents the table
-type Table struct {
-	relation *pglogrepl.RelationMessageV2
-}
-
-// Name returns the table name
-func (t *Table) Name() string {
-	return t.relation.RelationName
-}
-
-// Schema returns the table schema
-func (t *Table) Schema() string {
-	return t.relation.Namespace
+	// TableName is a string that represents the table
+	TableName pgx.Identifier
 }
 
 var _ pgx.CollectableRow = &Row{}
@@ -228,8 +216,27 @@ func (r *Row) RawValues() [][]byte {
 }
 
 // Scan implements pgx.CollectableRow.
-func (r *Row) Scan(dest ...any) error {
-	panic("unimplemented")
+func (r *Row) Scan(values ...any) error {
+	row, err := r.Values()
+	if err != nil {
+		return err
+	}
+
+	vcount := len(values)
+	rcount := len(row)
+	// check the number of columns
+	if vcount != rcount {
+		return fmt.Errorf("number of field descriptions must equal number of values, got %v and %v", vcount, rcount)
+	}
+	// copy the values
+	for index := range values {
+		source := reflect.ValueOf(row[index]).Elem()
+		// set the values
+		target := reflect.ValueOf(values[index]).Elem()
+		target.Set(source)
+	}
+
+	return nil
 }
 
 // Values implements pgx.CollectableRow.
