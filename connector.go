@@ -10,15 +10,15 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// Iterator is a struct that represents the state
-type Iterator struct {
+// Connector is a struct that represents the state
+type Connector struct {
 	conn     *pgconn.PgConn
 	deadline time.Time
 	position pglogrepl.LSN
 }
 
 // Start starts the iterator
-func (x *Iterator) Start(ctx context.Context, name string) error {
+func (x *Connector) Start(ctx context.Context, name string) error {
 	options := pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{
 			fmt.Sprintf("proto_version '%v'", 2),
@@ -43,7 +43,7 @@ func (x *Iterator) Start(ctx context.Context, name string) error {
 }
 
 // Status reports the Status of the replication
-func (x *Iterator) Status(ctx context.Context) error {
+func (x *Connector) Status(ctx context.Context) error {
 	if time.Now().After(x.deadline) {
 		output := pglogrepl.StandbyStatusUpdate{WALWritePosition: x.position}
 
@@ -58,7 +58,7 @@ func (x *Iterator) Status(ctx context.Context) error {
 }
 
 // Receive receives the message
-func (x *Iterator) Receive(ctx context.Context) (pgproto3.BackendMessage, error) {
+func (x *Connector) Receive(ctx context.Context) (pgproto3.BackendMessage, error) {
 	// create a new context with a deadline
 	ctx, cancel := context.WithDeadline(ctx, x.deadline)
 	// receive the message

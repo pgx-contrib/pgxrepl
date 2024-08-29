@@ -22,7 +22,7 @@ type Broker struct {
 
 // Run starts the replication
 func (x *Broker) Run(ctx context.Context) error {
-	// create the parser
+	// create the collector
 	collector := &Collector{
 		handler:   x.Handler,
 		relations: map[uint32]*pglogrepl.RelationMessageV2{},
@@ -30,24 +30,24 @@ func (x *Broker) Run(ctx context.Context) error {
 		stream:    false,
 	}
 
-	// create the iterator
-	iterator := &Iterator{
+	// create the connector
+	connector := &Connector{
 		conn: x.Conn,
 	}
 
 	// start the iterator
-	if err := iterator.Start(ctx, x.Name); err != nil {
+	if err := connector.Start(ctx, x.Name); err != nil {
 		return err
 	}
 
 	for {
 		// report the status
-		if err := iterator.Status(ctx); err != nil {
+		if err := connector.Status(ctx); err != nil {
 			return err
 		}
 
 		// receive the message
-		message, err := iterator.Receive(ctx)
+		message, err := connector.Receive(ctx)
 		switch {
 		case pgconn.Timeout(err):
 			continue
@@ -71,13 +71,13 @@ func (x *Broker) Run(ctx context.Context) error {
 			}
 
 			// update the state position
-			if info.ServerWALEnd > iterator.position {
-				iterator.position = info.ServerWALEnd
+			if info.ServerWALEnd > connector.position {
+				connector.position = info.ServerWALEnd
 			}
 
 			// reset the deadline
 			if info.ReplyRequested {
-				iterator.deadline = time.Time{}
+				connector.deadline = time.Time{}
 			}
 		case pglogrepl.XLogDataByteID:
 			// parse the log data
@@ -92,8 +92,8 @@ func (x *Broker) Run(ctx context.Context) error {
 			}
 
 			// update the state position
-			if data.WALStart > iterator.position {
-				iterator.position = data.WALStart
+			if data.WALStart > connector.position {
+				connector.position = data.WALStart
 			}
 		}
 	}

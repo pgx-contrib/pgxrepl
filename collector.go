@@ -2,7 +2,6 @@ package pgxrepl
 
 import (
 	"fmt"
-	"reflect"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -39,7 +38,7 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 		// arguments
-		operation := InsertOperation{
+		operation := &InsertOperation{
 			// set the table name
 			TableName: pgx.Identifier{
 				relation.Namespace,
@@ -63,7 +62,7 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 		// arguments
-		operation := UpdateOperation{
+		operation := &UpdateOperation{
 			// set the table name
 			TableName: pgx.Identifier{
 				relation.Namespace,
@@ -93,7 +92,7 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 		// arguments
-		operation := DeleteOperation{
+		operation := &DeleteOperation{
 			// set the table name
 			TableName: pgx.Identifier{
 				relation.Namespace,
@@ -152,7 +151,7 @@ type Handler interface {
 // InsertOperation is a struct that represents the insert operation
 type InsertOperation struct {
 	// NewRow is a the actual collecatable row
-	NewRow *Row
+	NewRow pgx.CollectableRow
 	// TableName is a string that represents the table
 	TableName pgx.Identifier
 }
@@ -160,9 +159,9 @@ type InsertOperation struct {
 // UpdateOperation is a struct that represents the update operation
 type UpdateOperation struct {
 	// NewRow is a the actual collecatable row
-	NewRow *Row
+	NewRow pgx.CollectableRow
 	// OldRow is a the actual collecatable row
-	OldRow *Row
+	OldRow pgx.CollectableRow
 	// Table is a string that represents the table
 	TableName pgx.Identifier
 }
@@ -170,7 +169,7 @@ type UpdateOperation struct {
 // DeleteOperation is a struct that represents the delete operation
 type DeleteOperation struct {
 	// OldRow is a the actual collecatable row
-	OldRow *Row
+	OldRow pgx.CollectableRow
 	// TableName is a string that represents the table
 	TableName pgx.Identifier
 }
@@ -184,9 +183,31 @@ type Row struct {
 	registry *pgtype.Map
 }
 
+// Values implements pgx.CollectableRow.
+func (r *Row) Values() ([]any, error) {
+	values := make([]any, r.metadata.ColumnNum)
+	// prepare the values
+	if err := r.Scan(values...); err != nil {
+		return nil, err
+	}
+	// done!
+	return values, nil
+}
+
+// RawValues implements pgx.CollectableRow.
+func (r *Row) RawValues() [][]byte {
+	values := make([][]byte, r.metadata.ColumnNum)
+
+	for index, column := range r.metadata.Columns {
+		values[index] = column.Data
+	}
+	// done!
+	return values
+}
+
 // FieldDescriptions implements pgx.CollectableRow.
 func (r *Row) FieldDescriptions() []pgconn.FieldDescription {
-	collection := []pgconn.FieldDescription{}
+	fields := []pgconn.FieldDescription{}
 
 	for index := range r.metadata.Columns {
 		column := r.relation.Columns[index]
@@ -196,76 +217,21 @@ func (r *Row) FieldDescriptions() []pgconn.FieldDescription {
 			DataTypeOID:  column.DataType,
 			TypeModifier: column.TypeModifier,
 			TableOID:     r.relation.RelationID,
+			Format:       pgtype.TextFormatCode,
 		}
 
-		collection = append(collection, description)
+		fields = append(fields, description)
 	}
 
-	return collection
-}
-
-// RawValues implements pgx.CollectableRow.
-func (r *Row) RawValues() [][]byte {
-	collection := make([][]byte, 0)
-
-	for _, column := range r.metadata.Columns {
-		collection = append(collection, column.Data)
-	}
-
-	return collection
+	return fields
 }
 
 // Scan implements pgx.CollectableRow.
 func (r *Row) Scan(values ...any) error {
-	row, err := r.Values()
-	if err != nil {
-		return err
-	}
-
-	vcount := len(values)
-	rcount := len(row)
-	// check the number of columns
-	if vcount != rcount {
-		return fmt.Errorf("number of field descriptions must equal number of values, got %v and %v", vcount, rcount)
-	}
-	// copy the values
-	for index := range values {
-		source := reflect.ValueOf(row[index]).Elem()
-		// set the values
-		target := reflect.ValueOf(values[index]).Elem()
-		target.Set(source)
-	}
-
-	return nil
-}
-
-// Values implements pgx.CollectableRow.
-func (r *Row) Values() ([]any, error) {
-	// Create a map to store the column collection
-	collection := make([]any, 0)
-
-	// decode is a function that decodes the data
-	decode := func(mi *pgtype.Map, data []byte, dataType uint32) (any, error) {
-		if dt, ok := mi.TypeForOID(dataType); ok {
-			return dt.Codec.DecodeValue(mi, dataType, pgtype.TextFormatCode, data)
-		}
-		return string(data), nil
-	}
-
-	for index, column := range r.metadata.Columns {
-		switch column.DataType {
-		case 'n': // null
-			collection = append(collection, nil)
-		case 'u': // unchanged toast
-			// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
-		case 't': // text
-			item, err := decode(r.registry, column.Data, r.relation.Columns[index].DataType)
-			if err != nil {
-				return nil, err
-			}
-			collection = append(collection, item)
-		}
-	}
-
-	return collection, nil
+	return pgx.ScanRow(
+		r.registry,
+		r.FieldDescriptions(),
+		r.RawValues(),
+		values...,
+	)
 }
