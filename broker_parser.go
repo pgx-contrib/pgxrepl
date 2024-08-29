@@ -39,7 +39,7 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 		// arguments
-		operation := InsertOperation{
+		operation := &InsertOperation{
 			// set the table name
 			TableName: pgx.Identifier{
 				relation.Namespace,
@@ -63,7 +63,7 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 		// arguments
-		operation := UpdateOperation{
+		operation := &UpdateOperation{
 			// set the table name
 			TableName: pgx.Identifier{
 				relation.Namespace,
@@ -93,7 +93,7 @@ func (x *Collector) Collect(data []byte) error {
 			return err
 		}
 		// arguments
-		operation := DeleteOperation{
+		operation := &DeleteOperation{
 			// set the table name
 			TableName: pgx.Identifier{
 				relation.Namespace,
@@ -152,7 +152,7 @@ type Handler interface {
 // InsertOperation is a struct that represents the insert operation
 type InsertOperation struct {
 	// NewRow is a the actual collecatable row
-	NewRow *Row
+	NewRow pgx.CollectableRow
 	// TableName is a string that represents the table
 	TableName pgx.Identifier
 }
@@ -160,9 +160,9 @@ type InsertOperation struct {
 // UpdateOperation is a struct that represents the update operation
 type UpdateOperation struct {
 	// NewRow is a the actual collecatable row
-	NewRow *Row
+	NewRow pgx.CollectableRow
 	// OldRow is a the actual collecatable row
-	OldRow *Row
+	OldRow pgx.CollectableRow
 	// Table is a string that represents the table
 	TableName pgx.Identifier
 }
@@ -170,7 +170,7 @@ type UpdateOperation struct {
 // DeleteOperation is a struct that represents the delete operation
 type DeleteOperation struct {
 	// OldRow is a the actual collecatable row
-	OldRow *Row
+	OldRow pgx.CollectableRow
 	// TableName is a string that represents the table
 	TableName pgx.Identifier
 }
