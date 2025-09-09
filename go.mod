@@ -4,7 +4,7 @@ go 1.23.0
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20240307033717-828fbfe908e9
-	github.com/jackc/pgx/v5 v5.7.5
+	github.com/jackc/pgx/v5 v5.7.6
 )
 
 require (
