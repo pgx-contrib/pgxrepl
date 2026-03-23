@@ -1,10 +1,10 @@
 module github.com/pgx-contrib/pgxrepl
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20240307033717-828fbfe908e9
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.1
 )
 
 require (
