@@ -2,6 +2,7 @@ package pgxrepl
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -9,229 +10,202 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// Collector is a struct that represents
-type Collector struct {
-	relations map[uint32]*pglogrepl.RelationMessageV2
-	registry  *pgtype.Map
-	handler   Handler
-	stream    bool
+// Handler receives decoded replication events. Every method is called in
+// WAL order on a single goroutine. Returning a non-nil error aborts the
+// broker loop; the slot's confirmed LSN is only advanced after HandleCommit
+// returns nil, so a failed event replays on restart.
+type Handler interface {
+	HandleBegin(*BeginOperation) error
+	HandleCommit(*CommitOperation) error
+	HandleInsert(*InsertOperation) error
+	HandleUpdate(*UpdateOperation) error
+	HandleDelete(*DeleteOperation) error
+	HandleTruncate(*TruncateOperation) error
 }
 
-// Collect processes the data
+// BeginOperation marks the start of a transaction.
+type BeginOperation struct {
+	XID        uint32
+	FinalLSN   pglogrepl.LSN
+	CommitTime time.Time
+}
+
+// CommitOperation marks the end of a transaction. The broker advances the
+// replication slot to TransactionEndLSN after the handler returns nil.
+type CommitOperation struct {
+	CommitLSN         pglogrepl.LSN
+	TransactionEndLSN pglogrepl.LSN
+	CommitTime        time.Time
+}
+
+// InsertOperation represents a single row insert.
+type InsertOperation struct {
+	TableName pgx.Identifier
+	NewRow    pgx.CollectableRow
+}
+
+// UpdateOperation represents a single row update. OldRow is nil unless the
+// table has REPLICA IDENTITY FULL or an explicit replica identity index.
+type UpdateOperation struct {
+	TableName pgx.Identifier
+	NewRow    pgx.CollectableRow
+	OldRow    pgx.CollectableRow
+}
+
+// DeleteOperation represents a single row delete. OldRow contains the key
+// columns (or all columns under REPLICA IDENTITY FULL).
+type DeleteOperation struct {
+	TableName pgx.Identifier
+	OldRow    pgx.CollectableRow
+}
+
+// TruncateOperation represents a TRUNCATE affecting one or more tables.
+type TruncateOperation struct {
+	TableNames      []pgx.Identifier
+	Cascade         bool
+	RestartIdentity bool
+}
+
+// Collector decodes pgoutput WAL payloads into handler calls.
+type Collector struct {
+	relations map[uint32]*pglogrepl.RelationMessage
+	registry  *pgtype.Map
+	handler   Handler
+}
+
+// Collect parses a WAL payload and dispatches to the handler.
 func (x *Collector) Collect(data []byte) error {
-	payload, err := pglogrepl.ParseV2(data, x.stream)
+	payload, err := pglogrepl.Parse(data)
 	if err != nil {
 		return err
 	}
 
 	switch m := payload.(type) {
-	case *pglogrepl.RelationMessageV2:
+	case *pglogrepl.RelationMessage:
 		x.relations[m.RelationID] = m
 	case *pglogrepl.BeginMessage:
-		// begin transaction
+		return x.handler.HandleBegin(&BeginOperation{
+			XID:        m.Xid,
+			FinalLSN:   m.FinalLSN,
+			CommitTime: m.CommitTime,
+		})
 	case *pglogrepl.CommitMessage:
-		// commit transaction
-	case *pglogrepl.InsertMessageV2:
-		// create a relation
+		return x.handler.HandleCommit(&CommitOperation{
+			CommitLSN:         m.CommitLSN,
+			TransactionEndLSN: m.TransactionEndLSN,
+			CommitTime:        m.CommitTime,
+		})
+	case *pglogrepl.InsertMessage:
 		relation, err := x.relation(m.RelationID)
 		if err != nil {
 			return err
 		}
-		// arguments
-		operation := &InsertOperation{
-			// set the table name
-			TableName: pgx.Identifier{
-				relation.Namespace,
-				relation.RelationName,
-			},
-			// set the new row
-			NewRow: &Row{
-				metadata: m.Tuple,
-				relation: relation,
-				registry: x.registry,
-			},
-		}
-		// handle the event
-		if err := x.handler.Handle(operation); err != nil {
-			return err
-		}
-	case *pglogrepl.UpdateMessageV2:
-		// create a relation
+		return x.handler.HandleInsert(&InsertOperation{
+			TableName: pgx.Identifier{relation.Namespace, relation.RelationName},
+			NewRow:    x.row(relation, m.Tuple),
+		})
+	case *pglogrepl.UpdateMessage:
 		relation, err := x.relation(m.RelationID)
 		if err != nil {
 			return err
 		}
-		// arguments
-		operation := &UpdateOperation{
-			// set the table name
-			TableName: pgx.Identifier{
-				relation.Namespace,
-				relation.RelationName,
-			},
-			// set the new row
-			NewRow: &Row{
-				relation: relation,
-				metadata: m.NewTuple,
-				registry: x.registry,
-			},
-			// set the old row
-			OldRow: &Row{
-				relation: relation,
-				metadata: m.OldTuple,
-				registry: x.registry,
-			},
-		}
-		// handle the event
-		if err := x.handler.Handle(operation); err != nil {
-			return err
-		}
-	case *pglogrepl.DeleteMessageV2:
-		// create a relation
+		return x.handler.HandleUpdate(&UpdateOperation{
+			TableName: pgx.Identifier{relation.Namespace, relation.RelationName},
+			NewRow:    x.row(relation, m.NewTuple),
+			OldRow:    x.row(relation, m.OldTuple),
+		})
+	case *pglogrepl.DeleteMessage:
 		relation, err := x.relation(m.RelationID)
 		if err != nil {
 			return err
 		}
-		// arguments
-		operation := &DeleteOperation{
-			// set the table name
-			TableName: pgx.Identifier{
-				relation.Namespace,
-				relation.RelationName,
-			},
-			// set the old row
-			OldRow: &Row{
-				relation: relation,
-				metadata: m.OldTuple,
-				registry: x.registry,
-			},
+		return x.handler.HandleDelete(&DeleteOperation{
+			TableName: pgx.Identifier{relation.Namespace, relation.RelationName},
+			OldRow:    x.row(relation, m.OldTuple),
+		})
+	case *pglogrepl.TruncateMessage:
+		names := make([]pgx.Identifier, 0, len(m.RelationIDs))
+		for _, id := range m.RelationIDs {
+			relation, err := x.relation(id)
+			if err != nil {
+				return err
+			}
+			names = append(names, pgx.Identifier{relation.Namespace, relation.RelationName})
 		}
-		// handle the event
-		if err := x.handler.Handle(operation); err != nil {
-			return err
-		}
-	case *pglogrepl.TruncateMessageV2:
-		// not handled
-	case *pglogrepl.TypeMessageV2:
-		// not handled
-	case *pglogrepl.OriginMessage:
-		// not handled
-	case *pglogrepl.LogicalDecodingMessageV2:
-		// not handled
-	case *pglogrepl.StreamStartMessageV2:
-		x.stream = true
-	case *pglogrepl.StreamStopMessageV2:
-		x.stream = false
-	case *pglogrepl.StreamCommitMessageV2:
-		// not handled
-	case *pglogrepl.StreamAbortMessageV2:
-		// not handled
+		return x.handler.HandleTruncate(&TruncateOperation{
+			TableNames:      names,
+			Cascade:         m.Option&pglogrepl.TruncateOptionCascade != 0,
+			RestartIdentity: m.Option&pglogrepl.TruncateOptionRestartIdentity != 0,
+		})
+	case *pglogrepl.TypeMessage, *pglogrepl.OriginMessage:
+		// Not exposed to the handler; see README non-goals.
 	default:
-		return fmt.Errorf("unknown message type in pgoutput stream: %T", m)
+		return fmt.Errorf("pgxrepl: unsupported pgoutput message: %T", m)
 	}
 
 	return nil
 }
 
-func (x *Collector) relation(id uint32) (*pglogrepl.RelationMessageV2, error) {
-	// get the relation from the relation ID
+func (x *Collector) relation(id uint32) (*pglogrepl.RelationMessage, error) {
 	relation, ok := x.relations[id]
 	if !ok {
-		return nil, fmt.Errorf("relation %d not found", id)
+		return nil, fmt.Errorf("pgxrepl: relation %d not found", id)
 	}
-
 	return relation, nil
 }
 
-// Handler is an interface that represents the handler
-type Handler interface {
-	// Handle handles the operation
-	Handle(any) error
-}
-
-// InsertOperation is a struct that represents the insert operation
-type InsertOperation struct {
-	// NewRow is a the actual collecatable row
-	NewRow pgx.CollectableRow
-	// TableName is a string that represents the table
-	TableName pgx.Identifier
-}
-
-// UpdateOperation is a struct that represents the update operation
-type UpdateOperation struct {
-	// NewRow is a the actual collecatable row
-	NewRow pgx.CollectableRow
-	// OldRow is a the actual collecatable row
-	OldRow pgx.CollectableRow
-	// Table is a string that represents the table
-	TableName pgx.Identifier
-}
-
-// DeleteOperation is a struct that represents the delete operation
-type DeleteOperation struct {
-	// OldRow is a the actual collecatable row
-	OldRow pgx.CollectableRow
-	// TableName is a string that represents the table
-	TableName pgx.Identifier
+func (x *Collector) row(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) *Row {
+	if tuple == nil {
+		return nil
+	}
+	return &Row{metadata: tuple, relation: relation, registry: x.registry}
 }
 
 var _ pgx.CollectableRow = &Row{}
 
-// Row is a struct that represents the row
+// Row adapts a pgoutput TupleData to pgx.CollectableRow, so handlers can
+// decode replicated values with pgx.RowTo / pgx.RowToStructByName.
 type Row struct {
 	metadata *pglogrepl.TupleData
-	relation *pglogrepl.RelationMessageV2
+	relation *pglogrepl.RelationMessage
 	registry *pgtype.Map
 }
 
 // Values implements pgx.CollectableRow.
 func (r *Row) Values() ([]any, error) {
 	values := make([]any, r.metadata.ColumnNum)
-	// prepare the values
 	if err := r.Scan(values...); err != nil {
 		return nil, err
 	}
-	// done!
 	return values, nil
 }
 
 // RawValues implements pgx.CollectableRow.
 func (r *Row) RawValues() [][]byte {
 	values := make([][]byte, r.metadata.ColumnNum)
-
 	for index, column := range r.metadata.Columns {
 		values[index] = column.Data
 	}
-	// done!
 	return values
 }
 
 // FieldDescriptions implements pgx.CollectableRow.
 func (r *Row) FieldDescriptions() []pgconn.FieldDescription {
-	fields := []pgconn.FieldDescription{}
-
+	fields := make([]pgconn.FieldDescription, 0, len(r.metadata.Columns))
 	for index := range r.metadata.Columns {
 		column := r.relation.Columns[index]
-
-		description := pgconn.FieldDescription{
+		fields = append(fields, pgconn.FieldDescription{
 			Name:         column.Name,
 			DataTypeOID:  column.DataType,
 			TypeModifier: column.TypeModifier,
 			TableOID:     r.relation.RelationID,
 			Format:       pgtype.TextFormatCode,
-		}
-
-		fields = append(fields, description)
+		})
 	}
-
 	return fields
 }
 
 // Scan implements pgx.CollectableRow.
 func (r *Row) Scan(values ...any) error {
-	return pgx.ScanRow(
-		r.registry,
-		r.FieldDescriptions(),
-		r.RawValues(),
-		values...,
-	)
+	return pgx.ScanRow(r.registry, r.FieldDescriptions(), r.RawValues(), values...)
 }

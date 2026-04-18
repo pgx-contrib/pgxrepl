@@ -10,53 +10,59 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// Broker is a struct that represents the replication
+// Broker runs the replication loop. It starts streaming from Slot using
+// Publication, decodes WAL payloads, and dispatches them to Handler.
+//
+// The slot's confirmed flush LSN advances only after Handler.HandleCommit
+// returns nil, so a failed transaction replays on restart.
 type Broker struct {
-	// Handler is the handler to process the data
-	Handler Handler
-	// Conn is the connection to the database
+	// Conn is an open replication connection (opened with
+	// "?replication=database" in the connection string).
 	Conn *pgconn.PgConn
-	// Name is the name of the replication
-	Name string
+	// Handler receives decoded operations.
+	Handler Handler
+	// Slot is the logical replication slot name (see CreateSlot).
+	Slot string
+	// Publication is the publication name (see CreatePublication).
+	Publication string
 }
 
-// Run starts the replication
+// Run blocks until ctx is canceled or a handler/connection error occurs.
 func (x *Broker) Run(ctx context.Context) error {
-	// create the collector
+	ack := &ackingHandler{Handler: x.Handler}
+
 	collector := &Collector{
-		handler:   x.Handler,
-		relations: map[uint32]*pglogrepl.RelationMessageV2{},
-		registry:  &pgtype.Map{},
-		stream:    false,
+		handler:   ack,
+		relations: map[uint32]*pglogrepl.RelationMessage{},
+		registry:  pgtype.NewMap(),
 	}
 
-	// create the connector
-	connector := &Connector{
-		conn: x.Conn,
-	}
+	connector := &Connector{conn: x.Conn}
+	ack.connector = connector
 
-	// start the iterator
-	if err := connector.Start(ctx, x.Name); err != nil {
+	if err := connector.Start(ctx, x.Slot, x.Publication); err != nil {
 		return err
 	}
 
 	for {
-		// report the status
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if err := connector.Status(ctx); err != nil {
 			return err
 		}
 
-		// receive the message
 		message, err := connector.Receive(ctx)
 		switch {
+		case ctx.Err() != nil:
+			return ctx.Err()
 		case pgconn.Timeout(err):
 			continue
 		case err != nil:
-			// handle the error
 			return err
 		}
 
-		// check if the message is a copy data
 		payload, ok := message.(*pgproto3.CopyData)
 		if !ok {
 			continue
@@ -64,37 +70,36 @@ func (x *Broker) Run(ctx context.Context) error {
 
 		switch payload.Data[0] {
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
-			// parse the primary keepalive message
 			info, err := pglogrepl.ParsePrimaryKeepaliveMessage(payload.Data[1:])
 			if err != nil {
 				return err
 			}
-
-			// update the state position
-			if info.ServerWALEnd > connector.position {
-				connector.position = info.ServerWALEnd
-			}
-
-			// reset the deadline
 			if info.ReplyRequested {
 				connector.deadline = time.Time{}
 			}
 		case pglogrepl.XLogDataByteID:
-			// parse the log data
 			data, err := pglogrepl.ParseXLogData(payload.Data[1:])
 			if err != nil {
 				return err
 			}
-
-			// parse the data
 			if err = collector.Collect(data.WALData); err != nil {
 				return err
 			}
-
-			// update the state position
-			if data.WALStart > connector.position {
-				connector.position = data.WALStart
-			}
 		}
 	}
+}
+
+// ackingHandler wraps the user's Handler and advances the connector's
+// confirmed LSN after each successful HandleCommit.
+type ackingHandler struct {
+	Handler
+	connector *Connector
+}
+
+func (h *ackingHandler) HandleCommit(op *CommitOperation) error {
+	if err := h.Handler.HandleCommit(op); err != nil {
+		return err
+	}
+	h.connector.Ack(op.TransactionEndLSN)
+	return nil
 }
