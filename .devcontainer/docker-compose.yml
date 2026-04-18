@@ -1,0 +1,26 @@
+services:
+  workspace:
+    image: mcr.microsoft.com/devcontainers/base:bookworm
+    volumes:
+      - ..:/home/vscode/workspace:cached
+    command: sleep infinity
+  postgres:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pgxrepl
+      POSTGRES_USER: vscode
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
